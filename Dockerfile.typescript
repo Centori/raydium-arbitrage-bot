@@ -1,0 +1,42 @@
+FROM node:18-slim
+WORKDIR /app
+
+# Install required dependencies
+RUN apt-get update && \
+    apt-get install -y wget && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy package files and install dependencies
+COPY package.json package-lock.json* tsconfig.json ./
+RUN npm install
+
+# Copy source code and configuration files
+COPY ts-src ./ts-src
+COPY *.ts ./
+COPY .env* ./
+COPY keys ./keys
+
+# Build TypeScript code
+RUN npm run build
+
+# Create data directories
+RUN mkdir -p data/liquidity data/metrics
+
+# Expose API port
+ARG API_PORT=3000
+ENV API_PORT=$API_PORT
+EXPOSE $API_PORT
+
+# Set default environment variables
+ENV NODE_ENV=production
+ENV TELEGRAM_BOT_TOKEN=""
+ENV TELEGRAM_CHAT_ID=""
+ENV TRADE_AMOUNT="0.5"
+ENV MIN_SCORE="75"
+ENV MAX_RISK_SCORE="40"
+ENV ENABLE_RISK_ANALYSIS="true"
+ENV ENABLE_METRICS="true"
+
+# Start the enhanced monitoring service
+CMD ["npm", "run", "monitor:enhanced"]

@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package jito.block_engine;
+
+service BlockEngine {
+  // Get tip accounts that can be used for MEV tips
+  rpc GetTipAccounts(GetTipAccountsRequest) returns (GetTipAccountsResponse);
+  
+  // Submit a bundle of transactions
+  rpc SubmitBundle(Bundle) returns (SubmitBundleResponse);
+  
+  // Get the next block height
+  rpc GetNextBlockHeight(GetNextBlockHeightRequest) returns (GetNextBlockHeightResponse);
+}
+
+message GetTipAccountsRequest {}
+
+message GetTipAccountsResponse {
+  repeated TipAccount tipAccounts = 1;
+}
+
+message TipAccount {
+  string address = 1;
+}
+
+message Bundle {
+  repeated bytes transactions = 1;
+  BundleAuth auth = 2;
+}
+
+message BundleAuth {
+  bytes signature = 1;
+}
+
+message SubmitBundleResponse {
+  string bundleId = 1;
+}
+
+message GetNextBlockHeightRequest {}
+
+message GetNextBlockHeightResponse {
+  uint64 nextBlockHeight = 1;
+}

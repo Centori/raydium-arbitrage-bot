@@ -1,0 +1,32 @@
+# fly.toml app configuration file generated for solassassin-mev on 2025-09-28T15:31:32+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'solassassin-mev'
+primary_region = 'lax'
+
+[build]
+  builder = 'paketobuildpacks/builder:base'
+
+[env]
+  DEX_ALLOC = '0.3'
+  EMAIL_NOTIFICATIONS = 'true'
+  MIN_PROFIT_SOL = '0.001'
+  NOTIFICATION_EMAIL = 'centori1@gmail.com'
+  PORT = '8080'
+  PYTHONUNBUFFERED = '1'
+  TRADE_AMOUNT_SOL = '0.3'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
