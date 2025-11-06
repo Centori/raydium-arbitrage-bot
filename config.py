@@ -4,7 +4,13 @@ from dotenv import load_dotenv
 import base64
 from pathlib import Path
 
-@dataclass
+import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
 class Config:
     # Load environment variables
     load_dotenv()
@@ -37,7 +43,9 @@ class Config:
     API_HOST: str = os.getenv('API_HOST', 'localhost')
 
     # External API endpoints (used when USE_LOCAL_API_SERVER=false)
-    JUPITER_API_URL: str = os.getenv('JUPITER_API_URL', 'https://quote-api.jup.ag/v6')
+    # NOTE: Jupiter API v6 is at quote-api.jup.ag which requires specific routing
+    # Using price API instead which is more stable
+    JUPITER_API_URL: str = os.getenv('JUPITER_API_URL', 'https://price.jup.ag/v6')
     DEXSCREENER_API_URL: str = os.getenv('DEXSCREENER_API_URL', 'https://api.dexscreener.com/latest')
     
     # Other endpoints
@@ -76,7 +84,29 @@ class Config:
         os.getenv('DISABLE_NOTIFICATIONS', 'false').lower() != 'true'
     )
     
-    def __post_init__(self):
+    def __init__(self):
+        # Load RPC endpoint
+        self.RPC_ENDPOINT = os.getenv('RPC_ENDPOINT', 'https://api.mainnet-beta.solana.com')
+        
+        # API Keys
+        self.BIRDEYE_API_KEY = os.getenv('BIRDEYE_API_KEY')
+        self.JUPITER_API_KEY = os.getenv('JUPITER_API_KEY')
+        self.HELIUS_API_KEY = os.getenv('HELIUS_API_KEY')
+        
+        # Trading Settings
+        self.TRADE_AMOUNT_SOL = float(os.getenv('TRADE_AMOUNT_SOL', '0.1'))
+        self.SLIPPAGE_BPS = int(os.getenv('SLIPPAGE_BPS', '50'))
+        self.MAX_PRIORITY_FEE = int(os.getenv('MAX_PRIORITY_FEE', '1000000'))
+        
+        # Elite Trader Settings
+        self.MIN_WIN_RATE = float(os.getenv('MIN_WIN_RATE', '0.85'))
+        self.MIN_RETURN_PCT = float(os.getenv('MIN_RETURN_PCT', '1000.0'))
+        self.MIN_TRADES = int(os.getenv('MIN_TRADES', '50'))
+        
+        # Liquidity Thresholds
+        self.MIN_LIQUIDITY_USD = int(os.getenv('MIN_LIQUIDITY_USD', '50000'))
+        self.SIGNIFICANT_LIQUIDITY_USD = int(os.getenv('SIGNIFICANT_LIQUIDITY_USD', '250000'))
+        self.MASSIVE_LIQUIDITY_USD = int(os.getenv('MASSIVE_LIQUIDITY_USD', '1000000'))
         # Check for required API keys
         if not self.RPC_ENDPOINT or "api-key=your-" in self.RPC_ENDPOINT.lower():
             raise ValueError("RPC_ENDPOINT not properly configured in .env file")

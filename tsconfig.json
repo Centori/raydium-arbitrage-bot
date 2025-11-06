@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "lib": ["es2020"],
+    "declaration": true,
+    "outDir": "./dist",
+    "rootDir": ".",
+    "strict": true,
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "baseUrl": ".",
+    "paths": {
+      "*": ["node_modules/*", "ts-src/types/*"]
+    },
+    "allowSyntheticDefaultImports": true,
+    "noImplicitAny": false,
+    "typeRoots": ["./node_modules/@types", "./ts-src/types"],
+    "sourceMap": true
+  },
+  "include": ["ts-src/**/*", "*.ts", "jito-ts/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -16,6 +16,8 @@ from pool_analyzer import PoolAnalyzer
 from risk_analyzer import RiskAnalyzer
 from api_client import BlockchainAPIClient, PoolData
 from raydium_pair import RaydiumPair
+from security_validator import SecurityValidator
+from gmgn_tracker import GMGNTracker
 
 logger = logging.getLogger("migration_sniper")
 
@@ -62,6 +64,8 @@ class MigrationSniper:
         self.pool_analyzer = pool_analyzer
         self.risk_analyzer = RiskAnalyzer(config)
         self.api_client = BlockchainAPIClient(config)
+        self.security_validator = SecurityValidator(config, self.api_client)
+        self.gmgn_tracker = GMGNTracker(config)
         self.executor = executor
         
         # Known V3 pools and their state
@@ -307,6 +311,31 @@ class MigrationSniper:
             if not v3_pool or not v4_pool:
                 return False
             
+            # RUN SECURITY CHECKS on base token
+            base_token = opp.base_token
+            if not self.security_validator.is_blacklisted(base_token):
+                security_report = await self.security_validator.validate_token(base_token)
+                
+                if not security_report.tradeable:
+                    logger.warning(f"Token {base_token} FAILED security checks: {security_report.warnings}")
+                    self.security_validator.blacklist_token(base_token, "Failed security validation")
+                    return False
+                
+                if security_report.overall_risk_score > 50:
+                    logger.warning(f"Token {base_token} has high risk score: {security_report.overall_risk_score}/100")
+                    return False
+            else:
+                logger.info(f"Skipping blacklisted token: {base_token}")
+                return False
+            
+            # CHECK SMART MONEY via GMGN.ai
+            smart_money_check = await self.gmgn_tracker.monitor_smart_money_for_token(base_token)
+            if not smart_money_check:
+                logger.info(f"Token {base_token} has no smart money interest (GMGN)")
+                # Don't reject completely, but lower confidence
+            else:
+                logger.info(f"Token {base_token} has smart money backing (GMGN)")
+            
             # Verify price difference still exists
             current_v3_price = float(v3_pool.quote_amount) / float(v3_pool.base_amount)
             current_v4_price = float(v4_pool.quote_amount) / float(v4_pool.base_amount)
@@ -355,7 +384,7 @@ class MigrationSniper:
                 }
                 
                 try:
-                    async with aiohttp.ClientSession(headers=self.api_client.headers) as session:
+                    async with aiohttp.ClientSession() as session:
                         async with session.post(self.config.RPC_ENDPOINT, json=tx_payload) as resp:
                             tx_data = await resp.json()
                             tx = tx_data.get("result")
@@ -404,7 +433,7 @@ class MigrationSniper:
                 "params": [address, {"encoding": "base64"}]
             }
             
-            async with aiohttp.ClientSession(headers=self.api_client.headers) as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.post(self.config.RPC_ENDPOINT, json=payload) as resp:
                     data = await resp.json()
                     if not data.get('result') or not data['result'].get('data'):
@@ -438,6 +467,9 @@ class MigrationSniper:
             # Verify opportunity is still valid
             if not await self._validate_opportunity(opp):
                 return
+            
+            # SEND PRE-TRADE NOTIFICATION
+            await self._send_trade_notification(opp)
             
             logger.info(f"Executing migration for pool {opp.old_pool_id} -> {opp.new_pool_id}")
             logger.info(f"Expected profit: ${opp.estimated_profit:.2f}")
@@ -479,6 +511,52 @@ class MigrationSniper:
         except Exception as e:
             logger.error(f"Error executing migration: {e}")
 
+    async def _send_trade_notification(self, opp: MigrationOpportunity):
+        """Send notification before executing trade"""
+        try:
+            # Calculate estimated ROI
+            position_value = self.config.TRADE_AMOUNT_SOL * opp.price_ratio
+            estimated_roi = (opp.estimated_profit / (self.config.TRADE_AMOUNT_SOL * opp.price_ratio)) * 100 if position_value > 0 else 0
+            
+            # Get GMGN signal if available
+            gmgn_signal = self.gmgn_tracker.get_signal_for_token(opp.base_token)
+            
+            notification = f"""
+🎯 MIGRATION SNIPE TARGET DETECTED
+
+💰 Token: {opp.base_token[:8]}...
+📊 Old Pool: {opp.old_pool_id[:8]}...
+📈 New Pool: {opp.new_pool_id[:8]}...
+
+💵 Trade Amount: {self.config.TRADE_AMOUNT_SOL} SOL
+📈 Estimated Profit: ${opp.estimated_profit:.2f}
+📊 Estimated ROI: {estimated_roi:.1f}%
+⚠️ Risk Score: {opp.risk_score}/100
+
+💎 Liquidity Ratio: {opp.liquidity_ratio:.2f}x
+📉 Price Impact: {opp.price_impact.combined_impact*100:.2f}%
+✅ Confidence: {opp.price_impact.confidence_score*100:.0f}%
+"""
+            
+            if gmgn_signal:
+                notification += f"""
+🧠 GMGN Smart Money:
+   Action: {gmgn_signal['action'].upper()}
+   Confidence: {gmgn_signal['confidence']}%
+   Holders: {gmgn_signal['smart_money_holders']}
+   24h Flow: ${gmgn_signal['net_flow_24h']:,.0f}
+"""
+            
+            notification += "\n⏰ Executing in 5 seconds..."
+            
+            logger.critical(notification)
+            
+            # Wait 5 seconds for review (optional - can be disabled)
+            # await asyncio.sleep(5)
+            
+        except Exception as e:
+            logger.error(f"Error sending trade notification: {e}")
+    
     def get_pending_migrations(self) -> List[MigrationOpportunity]:
         """Get list of currently pending migration opportunities"""
         try:

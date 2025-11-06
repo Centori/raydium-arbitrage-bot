@@ -1,9 +1,11 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
 from decimal import Decimal
 import logging
 import asyncio
 import time
+import json
+from datetime import datetime, timedelta
 from solders.pubkey import Pubkey
 from solders.transaction import Transaction, VersionedTransaction
 from solders.signature import Signature
@@ -44,6 +46,179 @@ class MigrationExecutor:
         self.max_retries = 3
         self.retry_delay = 2  # seconds
         
+        # Circuit breaker parameters
+        self.max_daily_loss = getattr(self.config, "MAX_DAILY_LOSS_SOL", Decimal("0.1"))  # 0.1 SOL
+        self.max_daily_trades = getattr(self.config, "MAX_DAILY_TRADES", 5)
+        self.blacklist_after_fails = getattr(self.config, "BLACKLIST_AFTER_FAILS", 2)
+        
+        # Trade tracking
+        self.trade_history: List[Dict] = []
+        self.token_failures: Dict[str, int] = {}  # Track failures per token
+        self.blacklisted_tokens: set = set()
+        self.circuit_breaker_active = False
+        
+        # Load trade history
+        self._load_trade_history()
+        
+    def _load_trade_history(self):
+        """Load trade history from disk"""
+        try:
+            with open('data/trade_history.json', 'r') as f:
+                data = json.load(f)
+                self.trade_history = data.get('trades', [])
+                self.token_failures = data.get('token_failures', {})
+                self.blacklisted_tokens = set(data.get('blacklisted_tokens', []))
+        except FileNotFoundError:
+            logger.info("No trade history found, starting fresh")
+        except Exception as e:
+            logger.error(f"Error loading trade history: {e}")
+    
+    def _save_trade_history(self):
+        """Save trade history to disk"""
+        try:
+            with open('data/trade_history.json', 'w') as f:
+                json.dump({
+                    'trades': self.trade_history[-100:],  # Keep last 100 trades
+                    'token_failures': self.token_failures,
+                    'blacklisted_tokens': list(self.blacklisted_tokens)
+                }, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving trade history: {e}")
+    
+    async def check_circuit_breaker(self) -> bool:
+        """Check if circuit breaker should be triggered"""
+        try:
+            # Check if manually triggered
+            if self.circuit_breaker_active:
+                logger.error("Circuit breaker ACTIVE - trading halted")
+                return False
+            
+            # Calculate daily P&L
+            daily_pnl = await self._calculate_daily_pnl()
+            
+            # Check daily loss limit
+            if daily_pnl < -self.max_daily_loss:
+                logger.error(f"🚨 CIRCUIT BREAKER: Daily loss {float(daily_pnl):.4f} SOL exceeds limit {float(self.max_daily_loss):.4f} SOL")
+                self.circuit_breaker_active = True
+                await self._send_emergency_alert(f"Daily loss limit exceeded: {float(daily_pnl):.4f} SOL")
+                return False
+            
+            # Check daily trade limit
+            daily_trades = self._count_daily_trades()
+            if daily_trades >= self.max_daily_trades:
+                logger.warning(f"Daily trade limit reached: {daily_trades}/{self.max_daily_trades}")
+                return False
+            
+            # Check recent failure rate
+            recent_failures = self._count_recent_failures()
+            if recent_failures >= 3:
+                logger.error(f"🚨 CIRCUIT BREAKER: {recent_failures} consecutive failures detected")
+                self.circuit_breaker_active = True
+                await self._send_emergency_alert(f"Too many failures: {recent_failures} consecutive")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking circuit breaker: {e}")
+            return False
+    
+    async def _calculate_daily_pnl(self) -> Decimal:
+        """Calculate profit/loss for the last 24 hours"""
+        try:
+            cutoff = datetime.now() - timedelta(hours=24)
+            cutoff_ts = cutoff.timestamp()
+            
+            daily_trades = [t for t in self.trade_history if t.get('timestamp', 0) > cutoff_ts]
+            
+            total_pnl = Decimal('0')
+            for trade in daily_trades:
+                if trade.get('success'):
+                    # Calculate net: (amount_out - amount_in - fees)
+                    amount_in = Decimal(str(trade.get('amount_in', 0)))
+                    amount_out = Decimal(str(trade.get('amount_out', 0)))
+                    fees = Decimal(str(trade.get('fees_paid', 0)))
+                    total_pnl += (amount_out - amount_in - fees)
+                else:
+                    # Failed trades lose fees
+                    fees = Decimal(str(trade.get('fees_paid', 0.001)))  # Estimate 0.001 SOL if not recorded
+                    total_pnl -= fees
+            
+            return total_pnl
+            
+        except Exception as e:
+            logger.error(f"Error calculating daily P&L: {e}")
+            return Decimal('0')
+    
+    def _count_daily_trades(self) -> int:
+        """Count trades in the last 24 hours"""
+        try:
+            cutoff = datetime.now() - timedelta(hours=24)
+            cutoff_ts = cutoff.timestamp()
+            return sum(1 for t in self.trade_history if t.get('timestamp', 0) > cutoff_ts)
+        except Exception as e:
+            logger.error(f"Error counting daily trades: {e}")
+            return 0
+    
+    def _count_recent_failures(self, window: int = 5) -> int:
+        """Count consecutive failures in recent trades"""
+        try:
+            recent = self.trade_history[-window:]
+            consecutive_failures = 0
+            
+            for trade in reversed(recent):
+                if not trade.get('success', False):
+                    consecutive_failures += 1
+                else:
+                    break  # Stop at first success
+            
+            return consecutive_failures
+            
+        except Exception as e:
+            logger.error(f"Error counting failures: {e}")
+            return 0
+    
+    async def _send_emergency_alert(self, message: str):
+        """Send emergency alert (could integrate with Telegram/email)"""
+        logger.critical(f"🚨 EMERGENCY: {message}")
+        # TODO: Add Telegram/email notification here
+    
+    def _record_trade(self, migration_info: MigrationContract, result: MigrationResult):
+        """Record trade result for circuit breaker tracking"""
+        try:
+            trade_record = {
+                'timestamp': time.time(),
+                'token': migration_info.target_pool,
+                'success': result.success,
+                'amount_in': str(result.amount_in),
+                'amount_out': str(result.amount_out),
+                'fees_paid': str(result.fees_paid),
+                'tx_signature': result.tx_signature,
+                'error': result.error_message
+            }
+            
+            self.trade_history.append(trade_record)
+            
+            # Track token failures
+            if not result.success:
+                token = migration_info.target_pool
+                self.token_failures[token] = self.token_failures.get(token, 0) + 1
+                
+                # Blacklist token if too many failures
+                if self.token_failures[token] >= self.blacklist_after_fails:
+                    self.blacklisted_tokens.add(token)
+                    logger.warning(f"Blacklisted token {token} after {self.token_failures[token]} failures")
+            
+            # Save updated history
+            self._save_trade_history()
+            
+        except Exception as e:
+            logger.error(f"Error recording trade: {e}")
+    
+    def is_token_blacklisted(self, token: str) -> bool:
+        """Check if token is blacklisted"""
+        return token in self.blacklisted_tokens
+    
     async def execute_migration(self,
                               migration_info: MigrationContract,
                               amount: Decimal,
@@ -51,6 +226,32 @@ class MigrationExecutor:
         """Execute a migration trade with retry logic and dynamic fee adjustment"""
         import time
         start_time = time.time()
+        
+        # Check circuit breaker FIRST
+        if not await self.check_circuit_breaker():
+            return MigrationResult(
+                success=False,
+                tx_signature=None,
+                execution_time=0,
+                amount_in=amount,
+                amount_out=Decimal(0),
+                effective_price=Decimal(0),
+                fees_paid=Decimal(0),
+                error_message="Circuit breaker active - trading halted"
+            )
+        
+        # Check if token is blacklisted
+        if self.is_token_blacklisted(migration_info.target_pool):
+            return MigrationResult(
+                success=False,
+                tx_signature=None,
+                execution_time=0,
+                amount_in=amount,
+                amount_out=Decimal(0),
+                effective_price=Decimal(0),
+                fees_paid=Decimal(0),
+                error_message="Token is blacklisted due to previous failures"
+            )
         
         try:
             # Initial validation
@@ -100,6 +301,8 @@ class MigrationExecutor:
                     )
                     
                     if result.success:
+                        # Record successful trade
+                        self._record_trade(migration_info, result)
                         return result
                         
                     # Increase priority fee for next attempt
@@ -115,7 +318,7 @@ class MigrationExecutor:
                     if attempt == self.max_retries - 1:
                         raise
                         
-            return MigrationResult(
+            result = MigrationResult(
                 success=False,
                 tx_signature=None,
                 execution_time=time.time() - start_time,
@@ -125,10 +328,12 @@ class MigrationExecutor:
                 fees_paid=Decimal(0),
                 error_message=f"Failed after {self.max_retries} attempts"
             )
+            self._record_trade(migration_info, result)
+            return result
             
         except Exception as e:
             logger.error(f"Migration execution failed: {str(e)}")
-            return MigrationResult(
+            result = MigrationResult(
                 success=False,
                 tx_signature=None,
                 execution_time=time.time() - start_time,
@@ -138,6 +343,8 @@ class MigrationExecutor:
                 fees_paid=Decimal(0),
                 error_message=str(e)
             )
+            self._record_trade(migration_info, result)
+            return result
             
     async def _validate_migration_state(self, migration_info: MigrationContract) -> bool:
         """Validate that migration is still valid and active"""

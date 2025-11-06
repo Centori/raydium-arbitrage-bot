@@ -88,36 +88,60 @@ class RaydiumPoolFetcher:
                 results[addr] = pool_data
         return results
     
-    async def fetch_raydium_pools_direct(self) -> List[Dict]:
-        """Fetch pools directly from Raydium API"""
+    async def fetch_dexscreener_pools(self) -> List[Dict]:
+        """Fetch Raydium pools from DexScreener API"""
         try:
-            urls = [
-                f"{self.raydium_api_endpoint}/pools",
-                f"{self.raydium_api_endpoint}/pools/info/ids",
-                f"{self.raydium_api_endpoint}/pools/info/mint/So11111111111111111111111111111111111111112"  # fallback example
-            ]
+            # Fetch top Raydium pools by volume
+            url = "https://api.dexscreener.com/latest/dex/search?q=SOL"
             
             async with aiohttp.ClientSession() as session:
-                for url in urls:
-                    try:
-                        async with session.get(url) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                # Some endpoints may return {data: [...]} wrapper
-                                if isinstance(data, dict) and 'data' in data:
-                                    items = data.get('data') or []
-                                else:
-                                    items = data if isinstance(data, list) else []
-                                logger.info(f"Fetched {len(items)} pools directly from Raydium API via {url}")
-                                return items
-                            else:
-                                logger.error(f"Error fetching Raydium pools: {response.status} at {url}")
-                    except Exception as e:
-                        logger.debug(f"Fetch error for {url}: {e}")
-                return []
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        pairs = data.get('pairs', [])
+                        # Filter for Raydium pairs only
+                        raydium_pairs = [p for p in pairs if p.get('dexId') == 'raydium']
+                        logger.info(f"Fetched {len(raydium_pairs)} Raydium pools from DexScreener")
+                        return raydium_pairs
+                    else:
+                        logger.error(f"DexScreener API error: {response.status}")
+                        return []
         except Exception as e:
-            logger.error(f"Error in direct Raydium pool fetch: {str(e)}")
+            logger.error(f"Error fetching from DexScreener: {str(e)}")
             return []
+    
+    async def fetch_raydium_pools_direct(self) -> List[Dict]:
+        """Fetch pools from multiple sources"""
+        all_pools = []
+        
+        try:
+            # Try DexScreener first (most reliable)
+            dexscreener_pools = await self.fetch_dexscreener_pools()
+            if dexscreener_pools:
+                all_pools.extend(dexscreener_pools)
+                logger.info(f"Got {len(dexscreener_pools)} pools from DexScreener")
+            
+            # Add rate limiting between API calls
+            await asyncio.sleep(1)
+            
+            # Try Raydium API v2 as fallback
+            try:
+                url = "https://api.raydium.io/v2/main/pairs"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                        if response.status == 200:
+                            raydium_pairs = await response.json()
+                            if isinstance(raydium_pairs, list) and raydium_pairs:
+                                all_pools.extend(raydium_pairs)
+                                logger.info(f"Got {len(raydium_pairs)} pools from Raydium API v2")
+            except Exception as e:
+                logger.debug(f"Raydium v2 API unavailable: {e}")
+            
+            return all_pools
+            
+        except Exception as e:
+            logger.error(f"Error in pool fetch: {str(e)}")
+            return all_pools
     
     async def fetch_jupiter_pairs(self) -> List[Dict]:
         """Fetch trading pairs from Jupiter to discover additional pools"""
@@ -148,7 +172,7 @@ class RaydiumPoolFetcher:
                 return list(self.pools_cache.values())
             
             # Check API health first
-            is_healthy = await self.api_client.check_api_health()
+            is_healthy = self.api_client.check_api_health()
             if not is_healthy:
                 raise Exception("API service is not available")
             
@@ -156,7 +180,7 @@ class RaydiumPoolFetcher:
             
             # If using local server, get pools from API client
             if self.api_client.use_local_server:
-                pools = await self.api_client.get_raydium_pools()
+                pools = self.api_client.get_raydium_pools()
                 logger.info(f"Fetched {len(pools)} pools from local API")
             else:
                 # Use direct external API fetching
@@ -214,7 +238,7 @@ class RaydiumPoolFetcher:
             return []
 
     def _convert_raydium_api_to_pool_data(self, raw_pool_data: Dict) -> Optional[PoolData]:
-        """Convert raw Raydium API data to PoolData object. Tries multiple common field names."""
+        """Convert raw API data (Raydium/DexScreener) to PoolData object."""
         try:
             from api_client import TokenInfo
 
@@ -223,8 +247,12 @@ class RaydiumPoolFetcher:
                     if k in d and d[k] not in (None, ""):
                         return d[k]
                 return default
+            
+            # Check if this is DexScreener format
+            if 'pairAddress' in raw_pool_data and 'baseToken' in raw_pool_data:
+                return self._convert_dexscreener_to_pool_data(raw_pool_data)
 
-            # Extract basic pool info
+            # Extract basic pool info (Raydium format)
             pool_id = pick(raw_pool_data, ['id', 'pool_id', 'ammId', 'amm_id', 'poolId'])
             if not pool_id:
                 return None
@@ -277,6 +305,62 @@ class RaydiumPoolFetcher:
             )
         except Exception as e:
             logger.debug(f"Error converting pool data: {e}")
+            return None
+    
+    def _convert_dexscreener_to_pool_data(self, dex_data: Dict) -> Optional[PoolData]:
+        """Convert DexScreener API format to PoolData"""
+        try:
+            from api_client import TokenInfo
+            
+            pool_id = dex_data.get('pairAddress')
+            if not pool_id:
+                return None
+            
+            base_token_data = dex_data.get('baseToken', {})
+            quote_token_data = dex_data.get('quoteToken', {})
+            
+            base_token = TokenInfo(
+                address=base_token_data.get('address', ''),
+                symbol=base_token_data.get('symbol', 'Unknown'),
+                name=base_token_data.get('name', 'Unknown Token'),
+                decimals=int(base_token_data.get('decimals', 9))
+            )
+            
+            quote_token = TokenInfo(
+                address=quote_token_data.get('address', ''),
+                symbol=quote_token_data.get('symbol', 'Unknown'),
+                name=quote_token_data.get('name', 'Unknown Token'),
+                decimals=int(quote_token_data.get('decimals', 6))
+            )
+            
+            # Estimate reserves from liquidity and price
+            liquidity = dex_data.get('liquidity', {})
+            usd_liquidity = float(liquidity.get('usd', 0))
+            price_usd = float(dex_data.get('priceUsd', 1))
+            
+            # Rough estimate of token amounts based on liquidity
+            # Assume 50/50 split of liquidity
+            if usd_liquidity > 0 and price_usd > 0:
+                base_amount = str(int((usd_liquidity / 2) / price_usd * (10 ** base_token.decimals)))
+                quote_amount = str(int((usd_liquidity / 2) * (10 ** quote_token.decimals)))
+            else:
+                base_amount = '0'
+                quote_amount = '0'
+            
+            return PoolData(
+                id=pool_id,
+                version=4,  # Assume V4 for DexScreener pools
+                base_token=base_token,
+                quote_token=quote_token,
+                lp_mint='',  # Not provided by DexScreener
+                base_vault='',
+                quote_vault='',
+                base_amount=base_amount,
+                quote_amount=quote_amount,
+                fee_rate=25  # Default Raydium fee
+            )
+        except Exception as e:
+            logger.debug(f"Error converting DexScreener data: {e}")
             return None
 
     async def refresh_pools_async(self) -> List[PoolData]:

@@ -166,6 +166,48 @@ class ArbitrageMonitor:
             console.print(f"[yellow]Error fetching Jupiter price: {str(e)}[/yellow]")
         return None
     
+    async def _fetch_jupiter_real_price(self, input_mint: str, output_mint: str, dex_filter: str = None) -> float:
+        """Fetch real-time price from Jupiter API with optional DEX filter"""
+        try:
+            url = f"{self.config.JUPITER_API_URL}/quote"
+            params = {
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": "1000000000",  # 1 token in smallest units
+                "onlyDirectRoutes": "true"  # Must be string for Jupiter API
+            }
+            
+            # Add DEX filter if specified
+            if dex_filter:
+                dex_mapping = {
+                    "Raydium": "raydium",
+                    "Orca": "orca",
+                    "Phoenix": "phoenix",
+                    "Meteora": "meteora"
+                }
+                if dex_filter in dex_mapping:
+                    params["dexes"] = dex_mapping[dex_filter]
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data and "outAmount" in data:
+                            # Calculate price based on amounts
+                            out_amount = float(data["outAmount"])
+                            in_amount = 1000000000.0
+                            
+                            # Determine decimals (simplified - SOL=9, USDC=6, USDT=6)
+                            out_decimals = 6 if output_mint == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" or output_mint == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" else 9
+                            in_decimals = 9 if input_mint == "So11111111111111111111111111111111111111112" else 6
+                            
+                            price = (out_amount / 10**out_decimals) / (in_amount / 10**in_decimals)
+                            return price
+            return 0.0
+        except Exception as e:
+            console.print(f"[dim yellow]Warning: Could not fetch real price: {str(e)}[/dim yellow]")
+            return 0.0
+    
     async def _update_pool_data(self):
         """Update pool data from all DEXes"""
         # Clear old data
@@ -180,11 +222,8 @@ class ArbitrageMonitor:
                 console.print(f"[yellow]Error fetching {dex_name} pools: {str(e)}[/yellow]")
     
     async def _fetch_dex_pools(self, dex_name: str, dex_config: Dict) -> List[DEXPoolData]:
-        """Fetch pool data for a specific DEX"""
+        """Fetch pool data for a specific DEX using real API data"""
         pools = []
-        
-        # For now, we'll simulate pool data for demonstration
-        # In production, you would fetch real data from each DEX's API or on-chain
         
         # Get token pairs from configuration
         token_pairs = []
@@ -200,26 +239,29 @@ class ArbitrageMonitor:
             ]
         
         for token_a, token_b in token_pairs:
-            # Simulate pool data with slight variations per DEX
-            base_price = 100.0 if token_a == "So11111111111111111111111111111111111111112" else 1.0
-            
-            # Add some price variation per DEX
-            price_variation = hash(dex_name) % 100 / 10000  # 0-1% variation
-            price = base_price * (1 + price_variation)
-            
-            pool = DEXPoolData(
-                dex_name=dex_name,
-                pool_address=f"{dex_name}_{token_a[:8]}_{token_b[:8]}",
-                token_a=token_a,
-                token_b=token_b,
-                reserve_a=1000000,
-                reserve_b=1000000 * price,
-                price_a_to_b=price,
-                price_b_to_a=1/price,
-                liquidity_usd=2000000,
-                volume_24h=500000
-            )
-            pools.append(pool)
+            try:
+                # Add delay to respect Jupiter API rate limits (max 5 req/sec = 200ms between calls)
+                await asyncio.sleep(0.25)  # 250ms delay = 4 requests per second
+                
+                # Fetch real price from Jupiter API
+                price = await self._fetch_jupiter_real_price(token_a, token_b, dex_name)
+                
+                if price > 0:
+                    pool = DEXPoolData(
+                        dex_name=dex_name,
+                        pool_address=f"{dex_name}_{token_a[:8]}_{token_b[:8]}",
+                        token_a=token_a,
+                        token_b=token_b,
+                        reserve_a=1000000,
+                        reserve_b=1000000 * price,
+                        price_a_to_b=price,
+                        price_b_to_a=1/price if price > 0 else 0,
+                        liquidity_usd=2000000,  # Would need separate API call for real liquidity
+                        volume_24h=500000
+                    )
+                    pools.append(pool)
+            except Exception as e:
+                console.print(f"[yellow]Error fetching price for {token_a[:8]}/{token_b[:8]} on {dex_name}: {e}[/yellow]")
         
         return pools
     
@@ -246,6 +288,33 @@ class ArbitrageMonitor:
         
         # Keep only top 20 opportunities
         self.active_opportunities = self.active_opportunities[:20]
+    
+    async def find_cross_dex_opportunities(self):
+        """Public method to find cross-DEX arbitrage opportunities"""
+        await self._update_pool_data()
+        opportunities = await self._find_cross_dex_opportunities()
+        
+        # Convert to dict format for compatibility
+        result = []
+        for opp in opportunities:
+            if opp.is_profitable:
+                # Calculate price difference percentage from the opportunity
+                # Price diff = gross profit / trade size * 100
+                trade_size = 0.01  # Our configured trade size
+                gross_profit = opp.expected_profit_sol + opp.gas_estimate + (trade_size * 0.005) + (trade_size * 0.015)
+                price_diff_pct = (gross_profit / trade_size) * 100 if trade_size > 0 else 0
+                
+                result.append({
+                    'pair': ' → '.join([t[:8] for t in opp.token_path[:2]]),
+                    'profit_usd': opp.expected_profit_usd,
+                    'price_diff_pct': price_diff_pct,
+                    'dexes': opp.dexes,
+                    'confidence': opp.confidence_score,
+                    'net_profit_sol': opp.net_profit_sol,
+                    'gas_cost': opp.gas_estimate,
+                    'price_impact': opp.price_impact
+                })
+        return result
     
     async def _find_cross_dex_opportunities(self) -> List[ArbitrageOpportunity]:
         """Find arbitrage opportunities between different DEXes"""
@@ -281,14 +350,37 @@ class ArbitrageMonitor:
                             buy_dex, sell_dex = dex2_name, dex1_name
                             buy_pool, sell_pool = pool2, pool1
                         
-                        # Calculate potential profit
-                        trade_amount_sol = min(self.config.MAX_BUY_SOL, 0.5)
-                        expected_profit_sol = trade_amount_sol * price_diff_pct / 100
+                        # Calculate potential profit with realistic trade size
+                        trade_amount_sol = min(self.config.MAX_BUY_SOL, 0.01)  # Use actual max trade size
+                        
+                        # Calculate gross profit from price difference
+                        gross_profit_sol = trade_amount_sol * price_diff_pct / 100
+                        
+                        # Account for slippage (from config, default 1.5%)
+                        slippage_bps = self.config.SLIPPAGE_BPS if hasattr(self.config, 'SLIPPAGE_BPS') else 150
+                        slippage_cost = trade_amount_sol * (slippage_bps / 10000)
+                        
+                        # Account for DEX fees (typical 0.25% per swap, 2 swaps = 0.5%)
+                        dex_fees = trade_amount_sol * 0.005  # 0.5% total for buy + sell
+                        
+                        # Account for gas fees (realistic Solana costs)
+                        # Base transaction: ~0.000005 SOL per signature
+                        # Priority fee: ~0.0001 SOL for faster execution
+                        # Total for 2 transactions (buy + sell)
+                        gas_cost = 0.0002  # Conservative estimate in SOL
+                        
+                        # Calculate net profit
+                        expected_profit_sol = gross_profit_sol - slippage_cost - dex_fees - gas_cost
                         expected_profit_usd = expected_profit_sol * self.sol_price
                         
-                        # Calculate confidence based on liquidity
+                        # Calculate price impact (should be minimal for small trades)
                         min_liquidity = min(buy_pool.liquidity_usd, sell_pool.liquidity_usd)
-                        confidence = min(1.0, min_liquidity / 100000)  # Full confidence at $100k+ liquidity
+                        price_impact_pct = (trade_amount_sol * self.sol_price / min_liquidity) * 100
+                        
+                        # Calculate confidence based on liquidity and price impact
+                        liquidity_confidence = min(1.0, min_liquidity / 100000)  # Full confidence at $100k+ liquidity
+                        impact_confidence = max(0.0, 1.0 - (price_impact_pct / 2))  # Lower confidence for high impact
+                        confidence = (liquidity_confidence + impact_confidence) / 2
                         
                         opportunity = ArbitrageOpportunity(
                             opportunity_id=f"CROSS_{buy_dex}_{sell_dex}_{int(time.time())}",
@@ -297,13 +389,14 @@ class ArbitrageMonitor:
                             token_path=[pool1.token_a, pool1.token_b],
                             expected_profit_sol=expected_profit_sol,
                             expected_profit_usd=expected_profit_usd,
-                            price_impact=trade_amount_sol / min_liquidity * 100,
+                            price_impact=price_impact_pct,
                             confidence_score=confidence,
                             timestamp=time.time(),
                             execution_path=[
                                 {"dex": buy_dex, "action": "BUY", "pool": buy_pool.pool_address},
                                 {"dex": sell_dex, "action": "SELL", "pool": sell_pool.pool_address}
-                            ]
+                            ],
+                            gas_estimate=gas_cost
                         )
                         
                         if opportunity.net_profit_sol > 0:

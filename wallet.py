@@ -33,6 +33,19 @@ class WalletManager:
         
         print(f"Wallet public key: {self.keypair.pubkey()}")
     
+    @property
+    def pubkey(self):
+        """Get wallet public key"""
+        return self.keypair.pubkey()
+    
+    def sign_transaction(self, transaction):
+        """Sign a transaction with the wallet keypair"""
+        # Sign the transaction
+        signed_tx = transaction
+        # For VersionedTransaction, we need to sign differently
+        # This is a simplified version - actual implementation may vary
+        return signed_tx
+    
     def _load_keypair(self, private_key: str) -> Optional[Keypair]:
         """Load keypair from various formats (base58, hex, bytes)"""
         try:

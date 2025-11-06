@@ -8,9 +8,15 @@
 # Wallet keys and sensitive files
 keys/
 *.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!config.example.json
 *.pem
 *.key
 *.keypair
+config.json
+migration_history.json
 
 # Logs
 *.log

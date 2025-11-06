@@ -1,0 +1,18 @@
+{
+    "network": "mainnet-beta",
+    "rpc_endpoint": "https://api.mainnet-beta.solana.com",
+    "trade_settings": {
+        "max_trade_size_sol": 0.25,
+        "slippage_bps": 50,
+        "max_priority_fee": 1000000
+    },
+    "strategy": {
+        "enable_flash_loans": true,
+        "enable_migration": true,
+        "min_profit_threshold": 0.01
+    },
+    "monitoring": {
+        "log_level": "INFO",
+        "enable_notifications": true
+    }
+}

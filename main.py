@@ -39,7 +39,7 @@ class ArbitrageBot:
         self.wallet_manager = WalletManager(config)
         
         # Initialize Jito executor with wallet manager
-        self.jito_executor = JitoExecutor(self.wallet_manager, config)
+        self.jito_executor = JitoExecutor(config, self.wallet_manager, self.api_client)
         
         # Initialize Telegram notifier
         self.telegram = TelegramNotifier(
